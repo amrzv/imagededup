@@ -1,14 +1,18 @@
+import sys
+from multiprocessing import cpu_count
 from pathlib import Path
 
 import os
 import json
 import numpy as np
+import torch
 from PIL import Image
 import pytest
-from tensorflow.keras.models import Model
+from torchvision.transforms import transforms
 
 from imagededup.methods.cnn import CNN
-from imagededup.utils.image_utils import load_image, expand_image_array_cnn
+from imagededup.utils.image_utils import load_image
+from imagededup.utils.models import MobilenetV3, CustomModel, EfficientNet, ViT
 
 
 p = Path(__file__)
@@ -17,9 +21,10 @@ TEST_IMAGE_DIR = p.parent / 'data' / 'base_images'
 TEST_IMAGE_FORMATS_DIR = p.parent / 'data' / 'formats_images'
 TEST_IMAGE_DIR_MIXED = p.parent / 'data' / 'mixed_images'
 TEST_IMAGE_GRAY = p.parent / 'data/ukbench00120_gray.jpg'
+TEST_IMAGE_DIR_MIXED_NESTED = p.parent / 'data' / 'mixed_nested_images'
 
 TEST_BATCH_SIZE = 64
-TEST_TARGET_SIZE = (224, 224)
+TEST_TARGET_SIZE = (256, 256)
 
 
 def data_encoding_map():
@@ -40,19 +45,108 @@ def mocker_save_json(mocker):
     return mocker.patch('imagededup.methods.cnn.save_json')
 
 
-def test__init(cnn):
+def test__init_defaults(cnn):
     assert cnn.batch_size == TEST_BATCH_SIZE
-    assert cnn.target_size == TEST_TARGET_SIZE
-    assert isinstance(cnn.model, Model)
+    assert cnn.model_config.name == MobilenetV3.name
+
+
+def test__init_custom():
+    cnn = CNN(model_config=CustomModel(model=EfficientNet(),
+                                       transform=EfficientNet.transform,
+                                       name=EfficientNet.name))
+    assert cnn.model_config.name == EfficientNet.name
+
+    cnn = CNN(model_config=CustomModel(model=ViT(),
+                                       transform=ViT.transform,
+                                       name=ViT.name))
+    assert cnn.model_config.name == ViT.name
+
+
+def test__init_missing_custom_args_raises_exception():
+    with pytest.raises(ValueError):
+        CNN(model_config=CustomModel(transform=ViT.transform,
+                                     name=ViT.name))
+
+    with pytest.raises(ValueError):
+        CNN(model_config=CustomModel(model=ViT(),
+                                     name=ViT.name))
+
+
+def test_default_custom_name_raises_warning():
+    with pytest.warns(SyntaxWarning):
+        CNN(model_config=CustomModel(model=EfficientNet(),
+                                     transform=EfficientNet.transform))
+
+
+def test_positional_init():
+    cnn = CNN(False, CustomModel(model=EfficientNet(),
+                                 transform=EfficientNet.transform,
+                                 name=EfficientNet.name))
+    assert cnn.verbose == 0
+    assert cnn.model_config.name == EfficientNet.name
+    assert cnn.model_config.transform == EfficientNet.transform
+
+
+class CallModel(torch.nn.Module):
+    transform = transforms.Compose(
+        [
+            transforms.ToTensor()
+        ]
+    )
+    name = 'test_custom_model'
+
+    def __init__(self):
+        super().__init__()
+
+    def __call__(self, x):
+        return x
+
+
+def test_call_method_accepted():
+    cnn = CNN(model_config=CustomModel(model=CallModel(),
+                                       transform=CallModel.transform,
+                                       name=CallModel.name))
+    assert cnn.model_config.name == CallModel.name
+    assert cnn.model_config.transform == CallModel.transform
+    try:
+        cnn.encode_images(TEST_IMAGE_DIR)
+    except Exception as e:
+        pytest.fail(f'Unexpected exception: {e}')
+
+
+class ForwardModel(torch.nn.Module):
+    transform = transforms.Compose(
+        [
+            transforms.ToTensor()
+        ]
+    )
+    name = 'test_custom_model'
+
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        return x
+
+
+def test_forward_method_accepted():
+    cnn = CNN(model_config=CustomModel(model=ForwardModel(),
+                                       transform=ForwardModel.transform,
+                                       name=ForwardModel.name))
+    assert cnn.model_config.name == ForwardModel.name
+    assert cnn.model_config.transform == ForwardModel.transform
+    try:
+        cnn.encode_images(TEST_IMAGE_DIR)
+    except Exception as e:
+        pytest.fail(f'Unexpected exception: {e}')
 
 
 def test__get_cnn_features_single(cnn):
-    img = load_image(TEST_IMAGE, target_size=(224, 224))
+    img = load_image(TEST_IMAGE, target_size=TEST_TARGET_SIZE)
 
     result = cnn._get_cnn_features_single(img)
-
     assert isinstance(result, np.ndarray)
-    assert result.shape == (1, 1024)
+    assert result.shape == (1, 576)
 
 
 def test__get_cnn_features_batch(cnn):
@@ -76,7 +170,7 @@ def test__get_cnn_features_batch(cnn):
 
     for i in result.values():
         assert isinstance(i, np.ndarray)
-        assert i.shape == (1024,)
+        assert i.shape == (576,)
 
     result = cnn._get_cnn_features_batch(TEST_IMAGE_FORMATS_DIR)
 
@@ -91,16 +185,58 @@ def test__get_cnn_features_batch(cnn):
         'ukbench09380.jpeg',
         'ukbench09380.png',
         'ukbench09380.svg',
+        'ukbench09380.webp',
     ]
 
     assert list(sorted(result.keys(), key=str.lower)) == expected_predicted_files
 
     for i in result.values():
         assert isinstance(i, np.ndarray)
-        assert i.shape == (1024,)
+        assert i.shape == (576,)
 
+
+def test__get_cnn_features_batch_nondefault_models():
+    cnn = CNN(model_config=CustomModel(model=EfficientNet(),
+                                       transform=EfficientNet.transform,
+                                       name=EfficientNet.name))
+    result = cnn._get_cnn_features_batch(TEST_IMAGE_DIR)
+
+    for i in result.values():
+        assert isinstance(i, np.ndarray)
+        assert i.shape == (1792,)
+
+    cnn = CNN(model_config=CustomModel(model=ViT(),
+                                       transform=ViT.transform,
+                                       name=ViT.name))
+    result = cnn._get_cnn_features_batch(TEST_IMAGE_DIR)
+
+    for i in result.values():
+        assert isinstance(i, np.ndarray)
+        assert i.shape == (768,)
+
+
+@pytest.mark.skipif(sys.platform == 'win32' or sys.platform == 'darwin', reason='runs only on linux.')
+def test__get_cnn_features_batch_num_workers_do_not_change_final_result(cnn):
+
+    result = cnn._get_cnn_features_batch(TEST_IMAGE_DIR, num_workers=4)
+
+    expected_predicted_files = [
+        'ukbench00120.jpg',
+        'ukbench01380.jpg',
+        'ukbench08976.jpg',
+        'ukbench08996.jpg',
+        'ukbench09012.jpg',
+        'ukbench09040.jpg',
+        'ukbench09060.jpg',
+        'ukbench09268.jpg',
+        'ukbench09348.jpg',
+        'ukbench09380.jpg',
+    ]
+
+    assert list(sorted(result.keys(), key=str.lower)) == expected_predicted_files
 
 # encode_image
+
 
 def test_encode_image_expand_image_array_cnn_gets_called(cnn, mocker):
     image_arr_2d = np.random.random((3, 3))
@@ -119,7 +255,7 @@ def test_encode_image_wrong_dim_input_array(cnn):
 def test_encode_image_2_dim_array_encoded(cnn):
     arr_inp = np.array(Image.open(TEST_IMAGE_GRAY))
     encoding = cnn.encode_image(image_array=arr_inp)
-    assert encoding.shape == (1, 1024)
+    assert encoding.shape == (1, 576)
 
 
 def test_encode_image_2_dim_file_equals_array(cnn):
@@ -133,19 +269,19 @@ def test_encode_image(cnn):
     result = cnn.encode_image(TEST_IMAGE)
 
     assert isinstance(result, np.ndarray)
-    assert result.shape == (1, 1024)  # 1024 = 3*3*1024*2
+    assert result.shape == (1, 576)  # 1024 = 3*3*1024*2
 
     result = cnn.encode_image(str(TEST_IMAGE))
 
     assert isinstance(result, np.ndarray)
-    assert result.shape == (1, 1024)  # 1024 = 3*3*1024*2
+    assert result.shape == (1, 576)  # 1024 = 3*3*1024*2
 
     with pytest.raises(ValueError):
         cnn.encode_image("")
 
     image_array = load_image(TEST_IMAGE)
     result = cnn.encode_image(image_array=image_array)
-    assert result.shape == (1, 1024)  # 1024 = 3*3*1024*2
+    assert result.shape == (1, 576)  # 1024 = 3*3*1024*2
 
 
 def test_encode_images(cnn):
@@ -168,7 +304,7 @@ def test_encode_images(cnn):
 
     for i in result.values():
         assert isinstance(i, np.ndarray)
-        assert i.shape == (1024,)
+        assert i.shape == (576,)
 
     result = cnn.encode_images(TEST_IMAGE_FORMATS_DIR)
 
@@ -183,13 +319,14 @@ def test_encode_images(cnn):
         'ukbench09380.jpeg',
         'ukbench09380.png',
         'ukbench09380.svg',
+        'ukbench09380.webp',
     ]
 
     assert list(sorted(result.keys(), key=str.lower)) == expected_predicted_files
 
     for i in result.values():
         assert isinstance(i, np.ndarray)
-        assert i.shape == (1024,)
+        assert i.shape == (576,)
 
     result = cnn.encode_images(str(TEST_IMAGE_FORMATS_DIR))
 
@@ -204,16 +341,70 @@ def test_encode_images(cnn):
         'ukbench09380.jpeg',
         'ukbench09380.png',
         'ukbench09380.svg',
+        'ukbench09380.webp',
     ]
 
     assert list(sorted(result.keys(), key=str.lower)) == expected_predicted_files
 
     for i in result.values():
         assert isinstance(i, np.ndarray)
-        assert i.shape == (1024,)
+        assert i.shape == (576,)
 
     with pytest.raises(ValueError):
         cnn.encode_images('abc')
+
+
+@pytest.mark.skipif(sys.platform == 'win32' or sys.platform == 'darwin', reason='CNN encoding parallelization not supported on Windows/mac.')
+def test_encode_images_num_workers(cnn, mocker):
+    num_enc_workers = 4
+    gen_batches_mocker = mocker.patch('imagededup.methods.cnn.CNN._get_cnn_features_batch')
+    result = cnn.encode_images(TEST_IMAGE_DIR, num_enc_workers=num_enc_workers)
+    gen_batches_mocker.assert_called_once_with(image_dir=TEST_IMAGE_DIR, recursive=False, num_workers=num_enc_workers)
+    
+
+@pytest.mark.skipif(sys.platform =='linux', reason='This test checks multiprocessing override on non-linux platforms.')
+def test_encode_images_num_workers_default_override_on_nonlinux(cnn, mocker):
+    num_enc_workers = 4
+    gen_batches_mocker = mocker.patch('imagededup.methods.cnn.CNN._get_cnn_features_batch')
+    result = cnn.encode_images(TEST_IMAGE_DIR, num_enc_workers=num_enc_workers)
+    gen_batches_mocker.assert_called_once_with(image_dir=TEST_IMAGE_DIR, recursive=False, num_workers=0)
+
+
+def test_recursive_on_flat_directory(cnn):
+    result = cnn.encode_images(TEST_IMAGE_DIR, recursive=True)
+
+    expected_predicted_files = [
+        'ukbench00120.jpg',
+        'ukbench01380.jpg',
+        'ukbench08976.jpg',
+        'ukbench08996.jpg',
+        'ukbench09012.jpg',
+        'ukbench09040.jpg',
+        'ukbench09060.jpg',
+        'ukbench09268.jpg',
+        'ukbench09348.jpg',
+        'ukbench09380.jpg',
+    ]
+
+    assert list(sorted(result.keys(), key=str.lower)) == expected_predicted_files
+
+    for i in result.values():
+        assert isinstance(i, np.ndarray)
+        assert i.shape == (576,)
+
+
+def test_finds_non_recursive(cnn):
+    result = cnn.encode_images(TEST_IMAGE_DIR_MIXED_NESTED)
+
+    expected_predicted_files = [
+        'ukbench00120_hflip.jpg',
+    ]
+
+    assert list(sorted(result.keys(), key=str.lower)) == expected_predicted_files
+
+    for i in result.values():
+        assert isinstance(i, np.ndarray)
+        assert i.shape == (576,)
 
 
 def test__check_threshold_bounds_input_not_float(cnn):
@@ -276,11 +467,12 @@ def test__find_duplicates_dict_outfile_true(cnn, mocker_save_json):
 # _find_duplicates_dir
 
 
-def test__find_duplicates_dir(cnn, mocker):
+def test_find_duplicates_dir(cnn, mocker):
     encoding_map = data_encoding_map()
     threshold = 0.8
     scores = True
     outfile = True
+    num_sim_workers = 2
     ret_val_find_dup_dict = {
         'filename1.jpg': [('dup1.jpg', 0.82)],
         'filename2.jpg': [('dup2.jpg', 0.90)],
@@ -296,23 +488,72 @@ def test__find_duplicates_dir(cnn, mocker):
         min_similarity_threshold=threshold,
         scores=scores,
         outfile=outfile,
+        num_enc_workers=0,
+        num_sim_workers=num_sim_workers
     )
-    encode_images_mocker.assert_called_once_with(image_dir=TEST_IMAGE_DIR)
+    encode_images_mocker.assert_called_once_with(image_dir=TEST_IMAGE_DIR, recursive=False, num_enc_workers=0)
     find_dup_dict_mocker.assert_called_once_with(
         encoding_map=cnn.encoding_map,
         min_similarity_threshold=threshold,
         scores=scores,
         outfile=outfile,
+        num_sim_workers=num_sim_workers
     )
 
-
+def test_find_duplicates_dir_num_enc_workers(cnn, mocker):
+    num_enc_workers = 2
+    
+    cnn.encoding_map = data_encoding_map()
+    ret_val_find_dup_dict = {
+        'filename1.jpg': [('dup1.jpg', 0.82)],
+        'filename2.jpg': [('dup2.jpg', 0.90)],
+    }
+    encode_images_mocker = mocker.patch('imagededup.methods.cnn.CNN.encode_images')
+    find_dup_dict_mocker = mocker.patch(
+        'imagededup.methods.cnn.CNN._find_duplicates_dict',
+        return_value=ret_val_find_dup_dict,
+    )
+    cnn._find_duplicates_dir(
+        image_dir=TEST_IMAGE_DIR,
+        min_similarity_threshold=0.9,
+        scores=False,
+        num_enc_workers=num_enc_workers,
+        num_sim_workers=cpu_count()
+    )
+    encode_images_mocker.assert_called_once_with(image_dir=TEST_IMAGE_DIR, recursive=False, num_enc_workers=num_enc_workers)
+    
+def test_find_duplicates_mp(cnn, mocker):
+    num_enc_workers = 2
+    num_sim_workers= 8
+    
+    find_dup_dir_mocker = mocker.patch(
+        'imagededup.methods.cnn.CNN._find_duplicates_dir',
+        return_value={'1.jpg': '2.jpg',
+                      '2.jpg': '1.jpg'},
+    )
+    cnn.find_duplicates(
+        image_dir=TEST_IMAGE_DIR,
+        min_similarity_threshold=0.9,
+        scores=False,
+        num_enc_workers=num_enc_workers,
+        num_sim_workers=num_sim_workers
+    )
+    find_dup_dir_mocker.assert_called_once_with(image_dir=TEST_IMAGE_DIR,
+        min_similarity_threshold=0.9,
+        scores=False,
+        outfile= None,
+        recursive=False,
+        num_enc_workers=num_enc_workers,
+        num_sim_workers=num_sim_workers)
+    
 # find_duplicates
 
 
-def test_find_duplicates_dir(cnn, mocker):
+def test_find_duplicates_with_dir(cnn, mocker):
     threshold = 0.9
     scores = True
     outfile = True
+    num_sim_workers = 2
     find_dup_dir_mocker = mocker.patch(
         'imagededup.methods.cnn.CNN._find_duplicates_dir'
     )
@@ -321,12 +562,16 @@ def test_find_duplicates_dir(cnn, mocker):
         min_similarity_threshold=threshold,
         outfile=outfile,
         scores=scores,
+        num_sim_workers=num_sim_workers
     )
     find_dup_dir_mocker.assert_called_once_with(
         image_dir=TEST_IMAGE_DIR,
         min_similarity_threshold=threshold,
         scores=scores,
         outfile=outfile,
+        recursive=False,
+        num_enc_workers=0,
+        num_sim_workers=num_sim_workers
     )
 
 
@@ -343,12 +588,82 @@ def test_find_duplicates_dict(cnn, mocker):
         min_similarity_threshold=threshold,
         outfile=outfile,
         scores=scores,
+        num_sim_workers=cpu_count()
     )
     find_dup_dict_mocker.assert_called_once_with(
         encoding_map=encoding_map,
         min_similarity_threshold=threshold,
         scores=scores,
         outfile=outfile,
+        num_sim_workers=cpu_count()
+    )
+
+
+def test_find_duplicates_dict_num_worker_has_impact(cnn, mocker):
+    encoding_map = data_encoding_map()
+    threshold = 0.9
+    scores = True
+    outfile = True
+    find_dup_dict_mocker = mocker.patch(
+        'imagededup.methods.cnn.CNN._find_duplicates_dict'
+    )
+    cnn.find_duplicates(
+        encoding_map=encoding_map,
+        min_similarity_threshold=threshold,
+        outfile=outfile,
+        scores=scores,
+        num_sim_workers=2
+    )
+    find_dup_dict_mocker.assert_called_once_with(
+        encoding_map=encoding_map,
+        min_similarity_threshold=threshold,
+        scores=scores,
+        outfile=outfile,
+        num_sim_workers=2
+    )
+
+
+def test_find_duplicates_dict_recursive_warning(cnn, mocker):
+    encoding_map = data_encoding_map()
+    threshold = 0.9
+    scores = True
+    outfile = True
+    find_dup_dict_mocker = mocker.patch(
+        'imagededup.methods.cnn.CNN._find_duplicates_dict'
+    )
+    with pytest.warns(SyntaxWarning):
+        cnn.find_duplicates(
+            encoding_map=encoding_map,
+            min_similarity_threshold=threshold,
+            outfile=outfile,
+            scores=scores,
+            recursive=True,
+        )
+    find_dup_dict_mocker.assert_called_once_with(
+        encoding_map=encoding_map,
+        min_similarity_threshold=threshold,
+        scores=scores,
+        outfile=outfile,
+        num_sim_workers=cpu_count()
+    )
+
+
+def test_find_duplicates_dict_num_enc_workers_warning(cnn, mocker):
+    encoding_map = data_encoding_map()
+    find_dup_dict_mocker = mocker.patch(
+        'imagededup.methods.cnn.CNN._find_duplicates_dict'
+    )
+    with pytest.warns(RuntimeWarning):
+        cnn.find_duplicates(
+            encoding_map=encoding_map,
+            num_enc_workers=2
+        )
+    find_dup_dict_mocker.assert_called_once_with(
+        encoding_map=encoding_map,
+        min_similarity_threshold=0.9,
+        scores=False,
+        outfile=None,
+        num_sim_workers=cpu_count()
     )
 
 
@@ -386,6 +701,9 @@ def test_find_duplicates_to_remove_outfile_false(cnn, mocker, mocker_save_json):
         encoding_map=None,
         min_similarity_threshold=threshold,
         scores=False,
+        recursive=False,
+        num_enc_workers=0,
+        num_sim_workers=cpu_count()
     )
     get_files_to_remove_mocker.assert_called_once_with(ret_val_find_dup_dict)
     mocker_save_json.assert_not_called()
@@ -415,6 +733,9 @@ def test_find_duplicates_to_remove_outfile_true(cnn, mocker, mocker_save_json):
         encoding_map=None,
         min_similarity_threshold=threshold,
         scores=False,
+        recursive=False,
+        num_enc_workers=0,
+        num_sim_workers=cpu_count()
     )
     get_files_to_remove_mocker.assert_called_once_with(ret_val_find_dup_dict)
     mocker_save_json.assert_called_once_with(ret_val_get_files_to_remove, outfile)
@@ -444,6 +765,9 @@ def test_find_duplicates_to_remove_encoding_map(cnn, mocker, mocker_save_json):
         image_dir=None,
         min_similarity_threshold=threshold,
         scores=False,
+        recursive=False,
+        num_enc_workers=0,
+        num_sim_workers=cpu_count()
     )
     get_files_to_remove_mocker.assert_called_once_with(ret_val_find_dup_dict)
     mocker_save_json.assert_called_once_with(ret_val_get_files_to_remove, outfile)
@@ -458,16 +782,21 @@ def test_find_duplicates_dir_integration(cnn):
         'ukbench00120.jpg': [
             ('ukbench00120_hflip.jpg', 0.9672552),
             ('ukbench00120_resize.jpg', 0.98120844),
+            ('ukbench00120_rotation.jpg',  0.90708774)
         ],
         'ukbench00120_hflip.jpg': [
             ('ukbench00120.jpg', 0.9672552),
             ('ukbench00120_resize.jpg', 0.95676106),
+            ('ukbench00120_rotation.jpg',  0.9030868)
         ],
         'ukbench00120_resize.jpg': [
             ('ukbench00120.jpg', 0.98120844),
             ('ukbench00120_hflip.jpg', 0.95676106),
+            ('ukbench00120_rotation.jpg',  0.9102372),
         ],
-        'ukbench00120_rotation.jpg': [],
+        'ukbench00120_rotation.jpg': [('ukbench00120.jpg', 0.90708774),
+                                      ('ukbench00120_hflip.jpg', 0.9030868),
+                                      ('ukbench00120_resize.jpg',  0.9102372)],
         'ukbench09268.jpg': [],
     }
     duplicates = cnn.find_duplicates(
@@ -476,8 +805,54 @@ def test_find_duplicates_dir_integration(cnn):
         scores=True,
         outfile=False,
     )
+    print(f'duplicates: {duplicates}')
     # verify variable type
     assert isinstance(duplicates['ukbench00120.jpg'][0][1], np.float32)
+
+    # verify that all files have been considered for deduplication
+    assert len(duplicates) == len(expected_duplicates)
+
+    # verify for each file that expected files have been received as duplicates
+    for k in duplicates.keys():
+        dup_val = duplicates[k]
+        expected_val = expected_duplicates[k]
+        dup_ret = set(map(lambda x: x[0], dup_val))
+        expected_ret = set(map(lambda x: x[0], expected_val))
+        assert dup_ret == expected_ret
+
+
+# test recursive find_duplicates with directory path
+def test_recursive_find_duplicates_dir_integration(cnn):
+    expected_duplicates = {
+        str(Path('lvl1/ukbench00120.jpg')): [
+            ('ukbench00120_hflip.jpg',  0.9891392),
+            (str(Path('lvl1/lvl2b/ukbench00120_resize.jpg')), 0.99194086),
+            (str(Path('lvl1/lvl2a/ukbench00120_rotation.jpg')),  0.90708774),
+        ],
+        'ukbench00120_hflip.jpg': [
+            (str(Path('lvl1/lvl2a/ukbench00120_rotation.jpg')), 0.9030868),
+            (str(Path('lvl1/ukbench00120.jpg')), 0.9891392),
+            (str(Path('lvl1/lvl2b/ukbench00120_resize.jpg')),  0.9793916),
+        ],
+        str(Path('lvl1/lvl2b/ukbench00120_resize.jpg')): [
+            (str(Path('lvl1/lvl2a/ukbench00120_rotation.jpg')), 0.9102372),
+            (str(Path('lvl1/ukbench00120.jpg')), 0.99194086),
+            ('ukbench00120_hflip.jpg',  0.9793916),
+        ],
+        str(Path('lvl1/lvl2a/ukbench00120_rotation.jpg')): [('ukbench00120_hflip.jpg',  0.9030868),
+                                                            (str(Path('lvl1/ukbench00120.jpg')), 0.90708774),
+                                                            (str(Path('lvl1/lvl2b/ukbench00120_resize.jpg')), 0.9102372)],
+        str(Path('lvl1/lvl2b/ukbench09268.jpg')): [],
+    }
+    duplicates = cnn.find_duplicates(
+        image_dir=TEST_IMAGE_DIR_MIXED_NESTED,
+        min_similarity_threshold=0.9,
+        scores=True,
+        outfile=False,
+        recursive=True,
+    )
+    # verify variable type
+    assert isinstance(duplicates[str(Path('lvl1/ukbench00120.jpg'))][0][1], np.float32)
 
     # verify that all files have been considered for deduplication
     assert len(duplicates) == len(expected_duplicates)
@@ -497,36 +872,42 @@ def test_find_duplicates_encoding_integration(cnn):
         'ukbench00120.jpg': [
             ('ukbench00120_hflip.jpg', 0.9672552),
             ('ukbench00120_resize.jpg', 0.98120844),
+            ('ukbench00120_rotation.jpg', 0.95676106),
         ],
         'ukbench00120_hflip.jpg': [
             ('ukbench00120.jpg', 0.9672552),
             ('ukbench00120_resize.jpg', 0.95676106),
+            ('ukbench00120_rotation.jpg', 0.95676106),
         ],
         'ukbench00120_resize.jpg': [
             ('ukbench00120.jpg', 0.98120844),
             ('ukbench00120_hflip.jpg', 0.95676106),
+            ('ukbench00120_rotation.jpg', 0.95676106),
         ],
-        'ukbench00120_rotation.jpg': [],
+        'ukbench00120_rotation.jpg': [('ukbench00120.jpg', 0.98120844),
+                                      ('ukbench00120_hflip.jpg', 0.98120844),
+                                      ('ukbench00120_resize.jpg', 0.98120844),],
         'ukbench09268.jpg': [],
     }
 
     encodings = cnn.encode_images(TEST_IMAGE_DIR_MIXED)
-    duplicates = cnn.find_duplicates(
-        encoding_map=encodings, min_similarity_threshold=0.9, scores=True, outfile=False
-    )
-    # verify variable type
-    assert isinstance(duplicates['ukbench00120.jpg'][0][1], np.float32)
+    with pytest.warns(None):
+        duplicates = cnn.find_duplicates(
+            encoding_map=encodings, min_similarity_threshold=0.9, scores=True, outfile=False
+        )
+        # verify variable type
+        assert isinstance(duplicates['ukbench00120.jpg'][0][1], np.float32)
 
-    # verify that all files have been considered for deduplication
-    assert len(duplicates) == len(expected_duplicates)
+        # verify that all files have been considered for deduplication
+        assert len(duplicates) == len(expected_duplicates)
 
-    # verify for each file that expected files have been received as duplicates
-    for k in duplicates.keys():
-        dup_val = duplicates[k]
-        expected_val = expected_duplicates[k]
-        dup_ret = set(map(lambda x: x[0], dup_val))
-        expected_ret = set(map(lambda x: x[0], expected_val))
-        assert dup_ret == expected_ret
+        # verify for each file that expected files have been received as duplicates
+        for k in duplicates.keys():
+            dup_val = duplicates[k]
+            expected_val = expected_duplicates[k]
+            dup_ret = set(map(lambda x: x[0], dup_val))
+            expected_ret = set(map(lambda x: x[0], expected_val))
+            assert dup_ret == expected_ret
 
 
 # test find_duplicates_to_remove with directory path
@@ -535,7 +916,20 @@ def test_find_duplicates_to_remove_dir_integration(cnn):
         image_dir=TEST_IMAGE_DIR_MIXED, min_similarity_threshold=0.9, outfile=False
     )
     assert set(duplicates_list) == set(
-        ['ukbench00120_resize.jpg', 'ukbench00120_hflip.jpg']
+        ['ukbench00120_resize.jpg', 'ukbench00120_hflip.jpg', 'ukbench00120_rotation.jpg']
+    )
+
+
+# test find_duplicates_to_remove with directory path
+def test_recursive_find_duplicates_to_remove_dir_integration(cnn):
+    duplicates_list = cnn.find_duplicates_to_remove(
+        image_dir=TEST_IMAGE_DIR_MIXED_NESTED,
+        min_similarity_threshold=0.9,
+        outfile=False,
+        recursive=True,
+    )
+    assert set(duplicates_list) == set(
+        [str(Path('lvl1/ukbench00120.jpg')), 'ukbench00120_hflip.jpg', str(Path('lvl1/lvl2b/ukbench00120_resize.jpg'))]
     )
 
 
@@ -546,61 +940,15 @@ def test_find_duplicates_to_remove_encoding_integration(cnn):
         encoding_map=encodings, min_similarity_threshold=0.9, outfile=False
     )
     assert set(duplicates_list) == set(
-        ['ukbench00120_resize.jpg', 'ukbench00120_hflip.jpg']
+        ['ukbench00120_resize.jpg', 'ukbench00120_hflip.jpg', 'ukbench00120_rotation.jpg']
     )
-
-
-# test verbose
-def test_encode_images_verbose_true(capsys):
-    cnn = CNN(verbose=True)
-    cnn.encode_images(image_dir=TEST_IMAGE_DIR)
-    out, err = capsys.readouterr()
-
-    assert '[==============================]' in out
-    assert '' == err
-
-
-def test_encode_images_verbose_false(capsys):
-    cnn = CNN(verbose=False)
-    cnn.encode_images(image_dir=TEST_IMAGE_DIR)
-    out, err = capsys.readouterr()
-    assert '' == out
-    assert '' == err
-
-
-def test_find_duplicates_verbose_true(capsys):
-    cnn = CNN(verbose=True)
-    cnn.find_duplicates(
-        image_dir=TEST_IMAGE_DIR,
-        min_similarity_threshold=0.8,
-        scores=False,
-        outfile=False,
-    )
-    out, err = capsys.readouterr()
-
-    assert '[==============================]' in out
-    assert '' == err
-
-
-def test_find_duplicates_verbose_false(capsys):
-    cnn = CNN(verbose=False)
-    cnn.find_duplicates(
-        image_dir=TEST_IMAGE_DIR,
-        min_similarity_threshold=0.8,
-        scores=False,
-        outfile=False,
-    )
-    out, err = capsys.readouterr()
-
-    assert '' == out
-    assert '' == err
 
 
 def test_scores_saving(cnn):
     save_file = 'myduplicates.json'
     cnn.find_duplicates(
         image_dir=TEST_IMAGE_DIR_MIXED,
-        min_similarity_threshold=0.6,
+        min_similarity_threshold=0.7,
         scores=True,
         outfile=save_file,
     )

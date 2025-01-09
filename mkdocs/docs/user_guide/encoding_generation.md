@@ -25,7 +25,7 @@ where the returned variable *encodings* is a dictionary mapping image file names
 ```
 For hashing algorithms, the encodings are 64 bit hashes represented as 16 character hexadecimal strings.
 
-For cnn, the encodings are numpy array with shape (1, 1024).
+For cnn, the encodings are numpy array with shape (576,).
 
 The 'method-name' corresponds to one of the deduplication methods available and can be set to:
 
@@ -37,13 +37,15 @@ The 'method-name' corresponds to one of the deduplication methods available and 
 
 
 #### Options
-- image_dir: Path to the image directory for which encodings are to be generated.
+- *image_dir*: Path to the image directory for which encodings are to be generated.
+- *recursive*: finding images recursively in a nested directory structure, set to *False* by default.
+
 
 #### Considerations
 
 - If an image in the image directory can't be loaded, no encodings are generated for the image. Hence, there is no entry 
 for the image in the returned encodings dictionary.
-- Supported image formats: 'JPEG', 'PNG', 'BMP', 'MPO', 'PPM', 'TIFF', 'GIF', 'SVG', 'PGM', 'PBM'.
+- Supported image formats: 'JPEG', 'PNG', 'BMP', 'MPO', 'PPM', 'TIFF', 'GIF', 'SVG', 'PGM', 'PBM', 'WEBP'.
 
 #### Examples
 
@@ -62,17 +64,17 @@ from imagededup.methods import <method-name>
 method_object = <method-name>()
 encoding = method_object.encode_image(image_file='path/to/image/file')
 ```
-where the returned variable *encoding* is either a hexadecimal string if a hashing method is used or a (1, 1024) numpy 
+where the returned variable *encoding* is either a hexadecimal string if a hashing method is used or a (576,) numpy 
 array if cnn is used.
 
 #### Options
-- image_file: Optional, path to the image file for which encodings are to be generated.
-- image_array: Optional, used instead of *image_file* attribute. A numpy array representing the image.
+- *image_file*: Optional, path to the image file for which encodings are to be generated.
+- *image_array*: Optional, used instead of *image_file* attribute. A numpy array representing the image.
 
 #### Considerations
 
 - If the image can't be loaded, no encodings are generated for the image and *None* is returned.
-- Supported image formats: 'JPEG', 'PNG', 'BMP', 'MPO', 'PPM', 'TIFF', 'GIF', 'SVG', 'PGM', 'PBM'.
+- Supported image formats: 'JPEG', 'PNG', 'BMP', 'MPO', 'PPM', 'TIFF', 'GIF', 'SVG', 'PGM', 'PBM', 'WEBP'.
 
 #### Examples
 

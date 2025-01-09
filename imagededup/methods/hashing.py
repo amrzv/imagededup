@@ -1,14 +1,23 @@
 import os
 import sys
+import warnings
+
 from pathlib import PurePath, Path
 from typing import Dict, List, Optional
 
-import pywt
+from multiprocessing import cpu_count
 import numpy as np
+import pywt
 from scipy.fftpack import dct
 
 from imagededup.handlers.search.retrieval import HashEval
-from imagededup.utils.general_utils import get_files_to_remove, save_json, parallelise
+from imagededup.utils.general_utils import (
+    get_files_to_remove,
+    save_json,
+    parallelise,
+    generate_files,
+    generate_relative_names
+)
 from imagededup.utils.image_utils import load_image, preprocess_image, check_image_array_hash
 from imagededup.utils.logger import return_logger
 
@@ -122,12 +131,14 @@ class Hashing:
 
         return self._hash_func(image_pp) if isinstance(image_pp, np.ndarray) else None
 
-    def encode_images(self, image_dir=None):
+    def encode_images(self, image_dir=None, recursive: bool = False, num_enc_workers: int = cpu_count()):
         """
         Generate hashes for all images in a given directory of images.
 
         Args:
             image_dir: Path to the image directory.
+            recursive: Optional, find images recursively in a nested image directory structure, set to False by default.
+            num_enc_workers: Optional, number of cpu cores to use for multiprocessing encoding generation, set to number of CPUs in the system by default. 0 disables multiprocessing.
 
         Returns:
             dictionary: A dictionary that contains a mapping of filenames and corresponding 64 character hash string
@@ -143,16 +154,12 @@ class Hashing:
         if not os.path.isdir(image_dir):
             raise ValueError('Please provide a valid directory path!')
 
-        image_dir = Path(image_dir)
-
-        files = [
-            i.absolute() for i in image_dir.glob('*') if not i.name.startswith('.')
-        ]  # ignore hidden files
+        files = generate_files(image_dir, recursive)
 
         logger.info(f'Start: Calculating hashes...')
 
-        hashes = parallelise(self.encode_image, files, self.verbose)
-        hash_initial_dict = dict(zip([f.name for f in files], hashes))
+        hashes = parallelise(function=self.encode_image, data=files, verbose=self.verbose, num_workers=num_enc_workers)
+        hash_initial_dict = dict(zip(generate_relative_names(image_dir, files), hashes))
         hash_dict = {
             k: v for k, v in hash_initial_dict.items() if v
         }  # To ignore None (returned if some probelm with image file)
@@ -196,6 +203,7 @@ class Hashing:
         scores: bool = False,
         outfile: Optional[str] = None,
         search_method: str = 'brute_force_cython' if not sys.platform == 'win32' else 'bktree',
+        num_dist_workers: int = cpu_count()
     ) -> Dict:
         """
         Take in dictionary {filename: encoded image}, detects duplicates below the given hamming distance threshold
@@ -209,6 +217,7 @@ class Hashing:
             duplicates.
             outfile: Optional, name of the file to save the results. Default is None.
             search_method: Algorithm used to retrieve duplicates. Default is brute_force_cython for Unix else bktree.
+            num_dist_workers: Optional, number of cpu cores to use for multiprocessing distance computation, set to number of CPUs in the system by default. 0 disables multiprocessing.
 
         Returns:
             if scores is True, then a dictionary of the form {'image1.jpg': [('image1_duplicate1.jpg',
@@ -225,6 +234,7 @@ class Hashing:
             verbose=self.verbose,
             threshold=max_distance_threshold,
             search_method=search_method,
+            num_dist_workers=num_dist_workers
         )
 
         logger.info('End: Evaluating hamming distances for getting duplicates')
@@ -234,42 +244,6 @@ class Hashing:
             save_json(self.results, outfile)
         return self.results
 
-    def _find_duplicates_dir(
-        self,
-        image_dir: PurePath,
-        max_distance_threshold: int = 10,
-        scores: bool = False,
-        outfile: Optional[str] = None,
-        search_method: str = 'brute_force_cython' if not sys.platform == 'win32' else 'bktree',
-    ) -> Dict:
-        """
-        Take in path of the directory in which duplicates are to be detected below the given hamming distance
-        threshold. Returns dictionary containing key as filename and value as a list of duplicate file names.
-        Optionally, the hamming distances could be returned instead of just duplicate filenames for each query file.
-
-        Args:
-            image_dir: Path to the directory containing all the images.
-            max_distance_threshold: Hamming distance between two images below which retrieved duplicates are valid.
-            scores: Boolean indicating whether Hamming distances are to be returned along with retrieved duplicates.
-            outfile: Name of the file the results should be written to.
-            search_method: Algorithm used to retrieve duplicates. Default is brute_force_cython for Unix else bktree.
-
-        Returns:
-            if scores is True, then a dictionary of the form {'image1.jpg': [('image1_duplicate1.jpg',
-            score), ('image1_duplicate2.jpg', score)], 'image2.jpg': [] ..}
-            if scores is False, then a dictionary of the form {'image1.jpg': ['image1_duplicate1.jpg',
-            'image1_duplicate2.jpg'], 'image2.jpg':['image1_duplicate1.jpg',..], ..}
-        """
-        encoding_map = self.encode_images(image_dir)
-        results = self._find_duplicates_dict(
-            encoding_map=encoding_map,
-            max_distance_threshold=max_distance_threshold,
-            scores=scores,
-            outfile=outfile,
-            search_method=search_method,
-        )
-        return results
-
     def find_duplicates(
         self,
         image_dir: PurePath = None,
@@ -278,6 +252,9 @@ class Hashing:
         scores: bool = False,
         outfile: Optional[str] = None,
         search_method: str = 'brute_force_cython' if not sys.platform == 'win32' else 'bktree',
+        recursive: Optional[bool] = False,
+        num_enc_workers: int = cpu_count(),
+        num_dist_workers: int = cpu_count()
     ) -> Dict:
         """
         Find duplicates for each file. Takes in path of the directory or encoding dictionary in which duplicates are to
@@ -296,6 +273,9 @@ class Hashing:
             scores: Optional, boolean indicating whether Hamming distances are to be returned along with retrieved duplicates.
             outfile: Optional, name of the file to save the results, must be a json. Default is None.
             search_method: Algorithm used to retrieve duplicates. Default is brute_force_cython for Unix else bktree.
+            recursive: Optional, find images recursively in a nested image directory structure, set to False by default.
+            num_enc_workers: Optional, number of cpu cores to use for multiprocessing encoding generation, set to number of CPUs in the system by default. 0 disables multiprocessing.
+            num_dist_workers: Optional, number of cpu cores to use for multiprocessing distance computation, set to number of CPUs in the system by default. 0 disables multiprocessing.
 
         Returns:
             duplicates dictionary: if scores is True, then a dictionary of the form {'image1.jpg': [('image1_duplicate1.jpg',
@@ -326,18 +306,70 @@ class Hashing:
                 scores=scores,
                 outfile=outfile,
                 search_method=search_method,
+                recursive=recursive,
+                num_enc_workers=num_enc_workers,
+                num_dist_workers=num_dist_workers
             )
         elif encoding_map:
+            if recursive:
+                warnings.warn('recursive parameter is irrelevant when using encodings.', SyntaxWarning)
+            
+            warnings.warn('Parameter num_enc_workers has no effect since encodings are already provided', RuntimeWarning)
+            
             result = self._find_duplicates_dict(
                 encoding_map=encoding_map,
                 max_distance_threshold=max_distance_threshold,
                 scores=scores,
                 outfile=outfile,
                 search_method=search_method,
+                num_dist_workers=num_dist_workers
             )
         else:
             raise ValueError('Provide either an image directory or encodings!')
         return result
+
+    def _find_duplicates_dir(
+        self,
+        image_dir: PurePath,
+        max_distance_threshold: int = 10,
+        scores: bool = False,
+        outfile: Optional[str] = None,
+        search_method: str = 'brute_force_cython' if not sys.platform == 'win32' else 'bktree',
+        recursive: Optional[bool] = False,
+        num_enc_workers: int = cpu_count(),
+        num_dist_workers: int = cpu_count()
+    ) -> Dict:
+        """
+        Take in path of the directory in which duplicates are to be detected below the given hamming distance
+        threshold. Returns dictionary containing key as filename and value as a list of duplicate file names.
+        Optionally, the hamming distances could be returned instead of just duplicate filenames for each query file.
+
+        Args:
+            image_dir: Path to the directory containing all the images.
+            max_distance_threshold: Hamming distance between two images below which retrieved duplicates are valid.
+            scores: Boolean indicating whether Hamming distances are to be returned along with retrieved duplicates.
+            outfile: Name of the file the results should be written to.
+            search_method: Algorithm used to retrieve duplicates. Default is brute_force_cython for Unix else bktree.
+            recursive: Optional, find images recursively in a nested image directory structure, set to False by default.
+            num_enc_workers: Optional, number of cpu cores to use for multiprocessing encoding generation, set to number of CPUs in the system by default. 0 disables multiprocessing.
+            num_dist_workers: Optional, number of cpu cores to use for multiprocessing distance computation, set to number of CPUs in the system by default. 0 disables multiprocessing.
+
+        Returns:
+            if scores is True, then a dictionary of the form {'image1.jpg': [('image1_duplicate1.jpg',
+            score), ('image1_duplicate2.jpg', score)], 'image2.jpg': [] ..}
+            if scores is False, then a dictionary of the form {'image1.jpg': ['image1_duplicate1.jpg',
+            'image1_duplicate2.jpg'], 'image2.jpg':['image1_duplicate1.jpg',..], ..}
+        """
+        encoding_map = self.encode_images(image_dir, recursive=recursive, num_enc_workers=num_enc_workers)
+        results = self._find_duplicates_dict(
+            encoding_map=encoding_map,
+            max_distance_threshold=max_distance_threshold,
+            scores=scores,
+            outfile=outfile,
+            search_method=search_method,
+            num_dist_workers=num_dist_workers
+        )
+        return results
 
     def find_duplicates_to_remove(
         self,
@@ -345,6 +377,9 @@ class Hashing:
         encoding_map: Dict[str, str] = None,
         max_distance_threshold: int = 10,
         outfile: Optional[str] = None,
+        recursive: Optional[bool] = False,
+        num_enc_workers: int = cpu_count(),
+        num_dist_workers: int = cpu_count()
     ) -> List:
         """
         Give out a list of image file names to remove based on the hamming distance threshold threshold. Does not
@@ -358,6 +393,9 @@ class Hashing:
             max_distance_threshold: Optional, hamming distance between two images below which retrieved duplicates are
                                     valid. (must be an int between 0 and 64). Default is 10.
             outfile: Optional, name of the file to save the results, must be a json. Default is None.
+            recursive: Optional, find images recursively in a nested image directory structure, set to False by default.
+            num_enc_workers: Optional, number of cpu cores to use for multiprocessing encoding generation, set to number of CPUs in the system by default. 0 disables multiprocessing.
+            num_dist_workers: Optional, number of cpu cores to use for multiprocessing distance computation, set to number of CPUs in the system by default. 0 disables multiprocessing.
 
         Returns:
             duplicates: List of image file names that are found to be duplicate of me other file in the directory.
@@ -382,6 +420,9 @@ class Hashing:
             encoding_map=encoding_map,
             max_distance_threshold=max_distance_threshold,
             scores=False,
+            recursive=recursive,
+            num_enc_workers=num_enc_workers,
+            num_dist_workers=num_dist_workers
         )
         files_to_remove = get_files_to_remove(result)
         if outfile:

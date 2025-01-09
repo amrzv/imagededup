@@ -1,7 +1,10 @@
 import json
+from multiprocessing import Pool
+from pathlib import Path, PurePath
+from typing import Callable, Dict, List, Union
+
 import tqdm
-from multiprocessing import cpu_count, Pool
-from typing import Callable, Dict, List
+
 from imagededup.utils.logger import return_logger
 
 logger = return_logger(__name__)
@@ -57,11 +60,29 @@ def save_json(results: Dict, filename: str, float_scores: bool = False) -> None:
     logger.info('End: Saving duplicates as json!')
 
 
-def parallelise(function: Callable, data: List, verbose: bool) -> List:
-    pool = Pool(processes=cpu_count())
+def parallelise(function: Callable, data: List, verbose: bool, num_workers: int) -> List:
+    num_workers = 1 if num_workers < 1 else num_workers  # Pool needs to have at least 1 worker.
+    pool = Pool(processes=num_workers)
     results = list(
         tqdm.tqdm(pool.imap(function, data, 100), total=len(data), disable=not verbose)
     )
     pool.close()
     pool.join()
     return results
+
+
+def generate_files(image_dir: Union[PurePath, str], recursive: bool) -> List:
+    if recursive:
+        glob_pattern = '**/*'
+    else:
+        glob_pattern = '*'
+
+    return [
+        i.absolute()
+        for i in Path(image_dir).glob(glob_pattern)
+        if not (i.name.startswith('.') or i.is_dir())
+    ]
+
+
+def generate_relative_names(image_dir: Union[PurePath, str], files: List) -> List:
+    return [str(f.relative_to(Path(image_dir).absolute())) for f in files]
